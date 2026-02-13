@@ -22,6 +22,7 @@ import re
 import signal
 import sys
 import time
+from collections import deque
 from typing import Dict, List, Optional
 
 try:
@@ -48,7 +49,9 @@ class BLEScanner:
                  output_file: Optional[str] = None,
                  verbose: bool = False,
                  quiet: bool = False,
-                 min_rssi: Optional[int] = None):
+                 min_rssi: Optional[int] = None,
+                 rssi_window: int = 1,
+                 active: bool = False):
         self.target_mac = target_mac.upper() if target_mac else None
         self.targeted = target_mac is not None
         self.timeout = timeout
@@ -68,13 +71,26 @@ class BLEScanner:
         self.output_format = output_format
         self.output_file = output_file
         self.records: List[dict] = []
+        # RSSI averaging
+        self.rssi_window = max(1, rssi_window)
+        self.rssi_history: Dict[str, deque] = {}
+        # Scanning mode
+        self.active = active
+
+    def _avg_rssi(self, addr: str, rssi: int) -> int:
+        """Update RSSI sliding window for a device and return the average."""
+        if addr not in self.rssi_history:
+            self.rssi_history[addr] = deque(maxlen=self.rssi_window)
+        self.rssi_history[addr].append(rssi)
+        return round(sum(self.rssi_history[addr]) / len(self.rssi_history[addr]))
 
     def _record_device(self, device: BLEDevice, adv: AdvertisementData,
-                       resolved: Optional[bool] = None):
+                       resolved: Optional[bool] = None, avg_rssi: Optional[int] = None):
         """Build a record dict from device/adv data and append to self.records."""
         rssi = adv.rssi
         tx_power = adv.tx_power
-        dist = _estimate_distance(rssi, tx_power)
+        rssi_for_dist = avg_rssi if avg_rssi is not None else rssi
+        dist = _estimate_distance(rssi_for_dist, tx_power)
 
         mfr_data = ""
         if adv.manufacturer_data:
@@ -94,21 +110,23 @@ class BLEScanner:
             "est_distance": round(dist, 2) if dist is not None else "",
             "manufacturer_data": mfr_data,
             "service_uuids": service_uuids,
+            "avg_rssi": avg_rssi if avg_rssi is not None else "",
             "resolved": resolved if resolved is not None else "",
         }
         self.records.append(record)
 
     def _print_device(self, device: BLEDevice, adv: AdvertisementData, label: str,
-                      resolved: Optional[bool] = None):
+                      resolved: Optional[bool] = None, avg_rssi: Optional[int] = None):
         # Always record for output file
-        self._record_device(device, adv, resolved=resolved)
+        self._record_device(device, adv, resolved=resolved, avg_rssi=avg_rssi)
 
         if self.quiet:
             return
 
         rssi = adv.rssi
         tx_power = adv.tx_power
-        dist = _estimate_distance(rssi, tx_power)
+        rssi_for_dist = avg_rssi if avg_rssi is not None else rssi
+        dist = _estimate_distance(rssi_for_dist, tx_power)
 
         print(f"\n{'='*60}")
         print(f"  {label}")
@@ -120,7 +138,12 @@ class BLEScanner:
             addr_line += "  (no match)"
         print(addr_line)
         print(f"  Name         : {device.name or 'Unknown'}")
-        print(f"  RSSI         : {rssi} dBm")
+        if avg_rssi is not None and self.rssi_window > 1:
+            addr_key = (device.address or "").upper()
+            n_samples = len(self.rssi_history.get(addr_key, []))
+            print(f"  RSSI         : {rssi} dBm  (avg: {avg_rssi} dBm over {n_samples} readings)")
+        else:
+            print(f"  RSSI         : {rssi} dBm")
         print(f"  TX Power     : {tx_power if tx_power is not None else 'N/A'} dBm")
         if dist is not None:
             print(f"  Est. Distance: ~{dist:.1f} m")
@@ -143,26 +166,33 @@ class BLEScanner:
     def detection_callback(self, device: BLEDevice, adv: AdvertisementData):
         addr = (device.address or "").upper()
 
-        # RSSI filtering — applies to all modes
-        if self.min_rssi is not None and adv.rssi < self.min_rssi:
+        # Compute averaged RSSI when windowing is enabled
+        avg_rssi = self._avg_rssi(addr, adv.rssi) if self.rssi_window > 1 else None
+        effective_rssi = avg_rssi if avg_rssi is not None else adv.rssi
+
+        # RSSI filtering — uses averaged RSSI when available
+        if self.min_rssi is not None and effective_rssi < self.min_rssi:
             return
 
         if self.irk_mode:
-            self._irk_detection(device, adv, addr)
+            self._irk_detection(device, adv, addr, avg_rssi=avg_rssi)
             return
 
         if self.targeted:
             if self.target_mac not in addr:
                 return
             self.seen_count += 1
-            self._print_device(device, adv, f"TARGET FOUND  —  detection #{self.seen_count}")
+            self._print_device(device, adv, f"TARGET FOUND  —  detection #{self.seen_count}",
+                               avg_rssi=avg_rssi)
         else:
             times_seen = self.unique_devices.get(addr, 0) + 1
             self.unique_devices[addr] = times_seen
             self.seen_count += 1
-            self._print_device(device, adv, f"DEVICE #{len(self.unique_devices)}  —  seen {times_seen}x")
+            self._print_device(device, adv, f"DEVICE #{len(self.unique_devices)}  —  seen {times_seen}x",
+                               avg_rssi=avg_rssi)
 
-    def _irk_detection(self, device: BLEDevice, adv: AdvertisementData, addr: str):
+    def _irk_detection(self, device: BLEDevice, adv: AdvertisementData, addr: str,
+                       avg_rssi: Optional[int] = None):
         """Handle a detection in IRK resolution mode."""
         self.seen_count += 1
 
@@ -190,14 +220,14 @@ class BLEScanner:
             self._print_device(
                 device, adv,
                 f"IRK RESOLVED  —  match #{det_count} (addr seen {times_seen}x)",
-                resolved=True,
+                resolved=True, avg_rssi=avg_rssi,
             )
         else:
             if self.verbose:
                 self._print_device(
                     device, adv,
                     f"IRK NO MATCH  —  addr seen {times_seen}x",
-                    resolved=False,
+                    resolved=False, avg_rssi=avg_rssi,
                 )
 
     async def scan(self):
@@ -216,6 +246,14 @@ class BLEScanner:
                 print(f"Mode: TARGETED — searching for {self.target_mac}")
             else:
                 print("Mode: DISCOVER ALL — showing every broadcasting device")
+            scan_mode = "active" if self.active else "passive"
+            print(f"Scanning: {scan_mode}", end="")
+            if self.rssi_window > 1:
+                print(f"  |  RSSI averaging: window of {self.rssi_window}")
+            else:
+                print()
+            if self.min_rssi is not None:
+                print(f"Min RSSI: {self.min_rssi} dBm")
             if self.timeout == float('inf'):
                 print("Running continuously  |  Press Ctrl+C to stop")
             else:
@@ -223,6 +261,8 @@ class BLEScanner:
             print(f"{'—'*60}")
 
         scanner_kwargs: dict = {"detection_callback": self.detection_callback}
+        if self.active:
+            scanner_kwargs["scanning_mode"] = "active"
         if self.irk_mode and platform.system() == "Darwin":
             scanner_kwargs["cb"] = {"use_bdaddr": True}
 
@@ -271,7 +311,7 @@ class BLEScanner:
         if self.output_format and self.records:
             filename = self.output_file or f"btrpa-scan-results.{self.output_format}"
             fieldnames = [
-                "timestamp", "address", "name", "rssi", "tx_power",
+                "timestamp", "address", "name", "rssi", "avg_rssi", "tx_power",
                 "est_distance", "manufacturer_data", "service_uuids", "resolved",
             ]
             if self.output_format == "json":
@@ -416,7 +456,21 @@ def main():
         type=int,
         default=None,
         metavar="DBM",
-        help="Minimum RSSI threshold (e.g. -60) — ignore weaker signals"
+        help="Minimum RSSI threshold (e.g. -70) — ignore weaker signals"
+    )
+    parser.add_argument(
+        "--rssi-window",
+        type=int,
+        default=1,
+        metavar="N",
+        help="RSSI sliding window size for averaging (e.g. 5–10). "
+             "Smooths noisy readings for more stable distance estimates (default: 1 = no averaging)"
+    )
+    parser.add_argument(
+        "--active",
+        action="store_true",
+        help="Use active scanning — sends SCAN_REQ to get SCAN_RSP with "
+             "additional service UUIDs and names (default: passive)"
     )
     args = parser.parse_args()
 
@@ -442,6 +496,10 @@ def main():
         parser.print_help()
         sys.exit(0)
 
+    # Validate RSSI window
+    if args.rssi_window < 1:
+        parser.error("--rssi-window must be at least 1")
+
     # Parse and validate IRK
     irk = None
     if args.irk:
@@ -466,6 +524,8 @@ def main():
         verbose=args.verbose,
         quiet=args.quiet,
         min_rssi=args.min_rssi,
+        rssi_window=args.rssi_window,
+        active=args.active,
     )
 
     def handle_signal(*_):

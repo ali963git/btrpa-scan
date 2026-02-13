@@ -11,6 +11,8 @@ A Bluetooth Low Energy (BLE) scanner with advanced Resolvable Private Address (R
 - **Targeted Search** - Search for a specific device by MAC address and monitor every detection
 - **IRK Resolution** - Resolve Resolvable Private Addresses against a known Identity Resolving Key to identify a device using randomized addresses for privacy
 - **RSSI Filtering** - Filter out weak signals with a minimum RSSI threshold
+- **RSSI Averaging** - Sliding window average smooths noisy BLE RSSI readings for more stable distance estimates
+- **Active Scanning** - Send SCAN_REQ to get SCAN_RSP with additional service UUIDs and device names that passive scanning misses
 - **CSV/JSON Export** - Export scan results to CSV or JSON files for further analysis
 - **Verbose/Quiet Modes** - Verbose mode shows additional details (e.g. non-matching RPAs in IRK mode); quiet mode suppresses per-device output and shows only the summary
 
@@ -40,7 +42,8 @@ pip install -r requirements.txt
 
 ```
 usage: btrpa-scan.py [-h] [-a] [--irk HEX] [-t TIMEOUT] [--output {csv,json}]
-                     [-o FILE] [-v | -q] [--min-rssi DBM] [mac]
+                     [-o FILE] [-v | -q] [--min-rssi DBM] [--rssi-window N]
+                     [--active] [mac]
 
 BLE Scanner — discover all devices or hunt for a specific one
 
@@ -57,7 +60,9 @@ optional arguments:
                         Output file path (default: btrpa-scan-results.<format>)
   -v, --verbose         Verbose mode — show additional details
   -q, --quiet           Quiet mode — suppress per-device output, show summary only
-  --min-rssi DBM        Minimum RSSI threshold (e.g. -60) — ignore weaker signals
+  --min-rssi DBM        Minimum RSSI threshold (e.g. -70) — ignore weaker signals
+  --rssi-window N       RSSI sliding window size for averaging (default: 1 = no averaging)
+  --active              Use active scanning (sends SCAN_REQ for additional data)
 ```
 
 ### Mode 1: Discover All Devices
@@ -104,8 +109,28 @@ The IRK can be provided in several formats:
 Only show devices with signal strength above a threshold:
 
 ```bash
-python3 btrpa-scan.py --all --min-rssi -50
+python3 btrpa-scan.py --all --min-rssi -70
 ```
+
+### RSSI Averaging
+
+BLE RSSI is inherently noisy. Use a sliding window average for more stable distance estimates and to filter out spurious weak detections:
+
+```bash
+python3 btrpa-scan.py --all --rssi-window 5
+```
+
+When windowing is active, the display shows both raw and averaged RSSI (e.g. `RSSI: -65 dBm (avg: -62 dBm over 5 readings)`), and distance estimation uses the averaged value. The `--min-rssi` filter also applies to the averaged RSSI, preventing a single noisy spike from dropping a device.
+
+### Active Scanning
+
+Passive scanning (the default) only sees advertisements. Active scanning sends `SCAN_REQ` and gets `SCAN_RSP`, which can reveal additional service UUIDs and device names:
+
+```bash
+python3 btrpa-scan.py --all --active
+```
+
+> **Note:** On macOS, CoreBluetooth always scans actively regardless of this flag. On Linux/BlueZ, active scanning may require root or `CAP_NET_ADMIN`.
 
 ### Exporting Results
 
