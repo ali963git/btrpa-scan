@@ -579,13 +579,20 @@ class BLEScanner:
 
 def _estimate_distance(rssi: int, tx_power: Optional[int],
                        env: str = "free_space") -> Optional[float]:
-    """Estimate distance in meters using the log-distance path loss model."""
+    """Estimate distance in meters using the log-distance path loss model.
+
+    BLE advertisements report *transmit power at the antenna* (e.g. +4 dBm),
+    but the path-loss formula requires the expected RSSI at the 1-meter
+    reference distance.  We convert by subtracting the free-space path loss
+    at 1 m for 2.4 GHz (~41 dB):  measured_power = tx_power - 41.
+    """
     if tx_power is None:
         return None
     if rssi == 0:
         return None
     n = _ENV_PATH_LOSS.get(env, 2.0)
-    return 10 ** ((tx_power - rssi) / (10 * n))
+    measured_power = tx_power - 41  # estimated RSSI at 1 m for BLE 2.4 GHz
+    return 10 ** ((measured_power - rssi) / (10 * n))
 
 
 def _bt_ah(irk: bytes, prand: bytes) -> bytes:
