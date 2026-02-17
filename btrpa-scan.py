@@ -1771,6 +1771,16 @@ def main():
         help="Live-updating terminal table instead of scrolling output"
     )
 
+    # GUI
+    parser.add_argument(
+        "--gui", action="store_true",
+        help="Launch web-based radar interface in the browser"
+    )
+    parser.add_argument(
+        "--gui-port", type=int, default=5000, metavar="PORT",
+        help="Port for GUI web server (default: 5000)"
+    )
+
     # GPS
     parser.add_argument(
         "--no-gps", action="store_true",
@@ -1821,6 +1831,16 @@ def main():
 
     if args.tui and args.quiet:
         parser.error("Cannot use --tui with --quiet")
+
+    if args.gui and not _HAS_FLASK:
+        parser.error("--gui requires Flask and flask-socketio. "
+                     "Install with: pip install flask flask-socketio")
+
+    if args.gui and args.tui:
+        parser.error("Cannot use --gui with --tui")
+
+    if args.gui and args.quiet:
+        parser.error("Cannot use --gui with --quiet")
 
     if args.irk and args.irk_file:
         parser.error("Cannot use --irk and --irk-file together")
@@ -1886,6 +1906,8 @@ def main():
         gps=not args.no_gps,
         ref_rssi=args.ref_rssi,
         name_filter=args.name_filter,
+        gui=args.gui,
+        gui_port=args.gui_port,
     )
 
     # On Windows, asyncio doesn't support loop.add_signal_handler, so
