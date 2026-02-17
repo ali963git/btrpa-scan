@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import csv
 import json
+import os
 import platform
 import re
 import signal
@@ -25,7 +26,8 @@ import sys
 import threading
 import time
 from collections import deque
-from typing import Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Set
 
 try:
     from bleak import BleakScanner
@@ -65,6 +67,14 @@ _ENV_PATH_LOSS = {
 # which corresponds to an offset of 59.
 _DEFAULT_REF_OFFSET = 59
 
+# Polling / timing constants
+_TUI_REFRESH_INTERVAL = 0.3       # seconds between TUI redraws
+_SCAN_POLL_INTERVAL = 0.5         # seconds between poll cycles (continuous)
+_TIMED_SCAN_POLL_INTERVAL = 0.1   # seconds between poll cycles (timed)
+_GPS_RECONNECT_DELAY = 5          # seconds before GPS reconnect attempt
+_GPS_SOCKET_TIMEOUT = 5           # seconds for GPS socket operations
+_GPS_STARTUP_DELAY = 0.5          # seconds to wait for initial GPS connection
+
 _FIELDNAMES = [
     "timestamp", "address", "name", "rssi", "avg_rssi", "tx_power",
     "est_distance", "latitude", "longitude", "gps_altitude",
@@ -81,6 +91,18 @@ _BANNER = r"""
    BLE Scanner with RPA Resolution
    by @HackingDave | TrustedSec
 """
+
+
+def _timestamp() -> str:
+    """Return an ISO 8601 timestamp with timezone offset."""
+    return datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def _mask_irk(irk_hex: str) -> str:
+    """Mask an IRK hex string, showing only the first and last 4 characters."""
+    if len(irk_hex) <= 8:
+        return irk_hex
+    return irk_hex[:4] + "..." + irk_hex[-4:]
 
 
 class GpsdReader:
@@ -124,11 +146,11 @@ class GpsdReader:
             with self._lock:
                 self._connected = False
             if self._running:
-                time.sleep(5)
+                time.sleep(_GPS_RECONNECT_DELAY)
 
     def _connect_and_read(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(5)
+        sock.settimeout(_GPS_SOCKET_TIMEOUT)
         try:
             sock.connect((self._host, self._port))
             with self._lock:
@@ -168,7 +190,7 @@ class GpsdReader:
 
 class BLEScanner:
     def __init__(self, target_mac: Optional[str], timeout: float,
-                 irk: Optional[bytes] = None,
+                 irks: Optional[List[bytes]] = None,
                  output_format: Optional[str] = None,
                  output_file: Optional[str] = None,
                  verbose: bool = False,
@@ -182,19 +204,20 @@ class BLEScanner:
                  tui: bool = False,
                  adapters: Optional[List[str]] = None,
                  gps: bool = True,
-                 ref_rssi: Optional[int] = None):
+                 ref_rssi: Optional[int] = None,
+                 name_filter: Optional[str] = None):
         self.target_mac = target_mac.upper() if target_mac else None
         self.targeted = target_mac is not None
         self.timeout = timeout
         self.seen_count = 0
         self.unique_devices: Dict[str, int] = {}
         self.running = True
-        # IRK mode
-        self.irk = irk
-        self.irk_mode = irk is not None
+        # IRK mode — supports one or more keys
+        self.irks = irks or []
+        self.irk_mode = len(self.irks) > 0
         self.resolved_devices: Dict[str, int] = {}
         self.rpa_count = 0
-        self.non_rpa_warned: set = set()
+        self.non_rpa_warned: Set[str] = set()
         # Options
         self.verbose = verbose
         self.quiet = quiet
@@ -215,6 +238,10 @@ class BLEScanner:
         self.log_file = log_file
         self._log_writer = None
         self._log_fh = None
+        # Only accumulate records in memory when batch output is requested.
+        # For long-running scans without --output, this prevents unbounded
+        # memory growth.  Real-time logging (--log) writes directly to disk.
+        self._accumulate_records = (output_format is not None)
         # TUI mode
         self.tui = tui
         self.tui_devices: Dict[str, dict] = {}
@@ -224,9 +251,13 @@ class BLEScanner:
         self.adapters = adapters
         # Reference RSSI calibration
         self.ref_rssi = ref_rssi
+        # Name filter
+        self.name_filter = name_filter
         # GPS
         self._gps = GpsdReader() if gps else None
         self.device_best_gps: Dict[str, dict] = {}
+        # Thread safety for detection callback (multi-adapter)
+        self._cb_lock = threading.Lock()
 
     def _avg_rssi(self, addr: str, rssi: int) -> int:
         """Update RSSI sliding window for a device and return the average."""
@@ -255,7 +286,7 @@ class BLEScanner:
         service_uuids = ", ".join(adv.service_uuids) if adv.service_uuids else ""
 
         return {
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp": _timestamp(),
             "address": device.address,
             "name": device.name or "Unknown",
             "rssi": rssi,
@@ -272,8 +303,9 @@ class BLEScanner:
 
     def _record_device(self, device: BLEDevice, adv: AdvertisementData,
                        resolved: Optional[bool] = None,
-                       avg_rssi: Optional[int] = None):
-        """Build a record, append to self.records, write to live log, update TUI state."""
+                       avg_rssi: Optional[int] = None) -> dict:
+        """Build a record, optionally append to self.records, write to live
+        log, and update TUI state.  Returns the record dict."""
         record = self._build_record(device, adv, resolved=resolved, avg_rssi=avg_rssi)
 
         # Stamp GPS coordinates on this record
@@ -294,7 +326,9 @@ class BLEScanner:
                         "rssi": current_rssi,
                     }
 
-        self.records.append(record)
+        # Accumulate records only when batch output is needed
+        if self._accumulate_records:
+            self.records.append(record)
 
         # Real-time CSV logging
         if self._log_writer is not None:
@@ -325,20 +359,19 @@ class BLEScanner:
                           f"within ~{record['est_distance']:.1f}m "
                           f"(threshold: {self.alert_within}m)")
 
+        return record
+
     def _print_device(self, device: BLEDevice, adv: AdvertisementData,
                       label: str, resolved: Optional[bool] = None,
                       avg_rssi: Optional[int] = None):
         # Always record for output / log / TUI
-        self._record_device(device, adv, resolved=resolved, avg_rssi=avg_rssi)
+        record = self._record_device(device, adv, resolved=resolved, avg_rssi=avg_rssi)
 
         if self.quiet or self.tui:
             return
 
         rssi = adv.rssi
-        tx_power = adv.tx_power
-        rssi_for_dist = avg_rssi if avg_rssi is not None else rssi
-        dist = _estimate_distance(rssi_for_dist, tx_power, self.environment,
-                                  ref_rssi=self.ref_rssi)
+        dist = record["est_distance"]
 
         print(f"\n{'='*60}")
         print(f"  {label}")
@@ -356,8 +389,9 @@ class BLEScanner:
             print(f"  RSSI         : {rssi} dBm  (avg: {avg_rssi} dBm over {n_samples} readings)")
         else:
             print(f"  RSSI         : {rssi} dBm")
+        tx_power = adv.tx_power
         print(f"  TX Power     : {tx_power if tx_power is not None else 'N/A'} dBm")
-        if dist is not None:
+        if dist != "":
             print(f"  Est. Distance: ~{dist:.1f} m")
         if adv.local_name and adv.local_name != device.name:
             print(f"  Local Name   : {adv.local_name}")
@@ -380,6 +414,11 @@ class BLEScanner:
         print(f"{'='*60}")
 
     def detection_callback(self, device: BLEDevice, adv: AdvertisementData):
+        with self._cb_lock:
+            self._detection_callback_inner(device, adv)
+
+    def _detection_callback_inner(self, device: BLEDevice,
+                                  adv: AdvertisementData):
         addr = (device.address or "").upper()
 
         # Compute averaged RSSI when windowing is enabled
@@ -389,6 +428,12 @@ class BLEScanner:
         # RSSI filtering — uses averaged RSSI when available
         if self.min_rssi is not None and effective_rssi < self.min_rssi:
             return
+
+        # Name filtering (case-insensitive substring match)
+        if self.name_filter is not None:
+            name = device.name or ""
+            if self.name_filter.lower() not in name.lower():
+                return
 
         if self.irk_mode:
             self._irk_detection(device, adv, addr, avg_rssi=avg_rssi)
@@ -425,7 +470,12 @@ class BLEScanner:
         times_seen = self.unique_devices.get(addr, 0) + 1
         self.unique_devices[addr] = times_seen
 
-        resolved = _resolve_rpa(self.irk, addr)
+        # Check address against all loaded IRKs
+        resolved = False
+        for irk in self.irks:
+            if _resolve_rpa(irk, addr):
+                resolved = True
+                break
 
         if resolved:
             self.rpa_count += 1
@@ -502,7 +552,8 @@ class BLEScanner:
                     break
                 avg_str = str(dev["avg_rssi"]) if dev["avg_rssi"] is not None else ""
                 dist_str = (f"~{dev['est_distance']:.1f}m"
-                            if dev["est_distance"] != "" else "")
+                            if isinstance(dev["est_distance"], (int, float))
+                            else "")
                 line = col_fmt.format(
                     (dev["address"] or "")[:18],
                     dev["name"][:15],
@@ -514,7 +565,7 @@ class BLEScanner:
                 if dev.get("resolved") is True:
                     attr = curses.A_BOLD
                 if (self.alert_within is not None
-                        and dev["est_distance"] != ""
+                        and isinstance(dev["est_distance"], (int, float))
                         and dev["est_distance"] <= self.alert_within):
                     attr |= curses.A_STANDOUT
                 screen.addnstr(row, 0, line, w - 1, attr)
@@ -534,10 +585,17 @@ class BLEScanner:
     # ------------------------------------------------------------------
 
     async def scan(self):
+        # Install signal handlers inside the async context for clean
+        # shutdown without the signal-handler / KeyboardInterrupt race.
+        loop = asyncio.get_running_loop()
+        if platform.system() != "Windows":
+            loop.add_signal_handler(signal.SIGINT, self.stop)
+            loop.add_signal_handler(signal.SIGTERM, self.stop)
+
         # Start GPS reader
         if self._gps is not None:
             self._gps.start()
-            await asyncio.sleep(0.5)  # allow initial connection
+            await asyncio.sleep(_GPS_STARTUP_DELAY)
 
         # Open real-time CSV log
         if self.log_file:
@@ -591,6 +649,9 @@ class BLEScanner:
         if self.active:
             scanner_kwargs["scanning_mode"] = "active"
         if self.irk_mode and platform.system() == "Darwin":
+            # Undocumented CoreBluetooth API to retrieve real BD_ADDR
+            # instead of CoreBluetooth UUIDs.  May break in future
+            # Bleak releases.
             scanner_kwargs["cb"] = {"use_bdaddr": True}
 
         # Multi-adapter support
@@ -612,12 +673,14 @@ class BLEScanner:
                 while self.running:
                     if self._tui_screen is not None:
                         self._redraw_tui(self._tui_screen)
-                    await asyncio.sleep(0.3 if self.tui else 0.5)
+                    await asyncio.sleep(
+                        _TUI_REFRESH_INTERVAL if self.tui
+                        else _SCAN_POLL_INTERVAL)
             else:
                 while self.running and (time.time() - start) < self.timeout:
                     if self._tui_screen is not None:
                         self._redraw_tui(self._tui_screen)
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(_TIMED_SCAN_POLL_INTERVAL)
         except asyncio.CancelledError:
             pass
         finally:
@@ -630,8 +693,14 @@ class BLEScanner:
         """Print scan configuration banner."""
         print(_BANNER)
         if self.irk_mode:
-            print("Mode: IRK RESOLUTION — resolving RPAs against provided IRK")
-            print(f"  IRK: {self.irk.hex()}")
+            n_irks = len(self.irks)
+            if n_irks == 1:
+                print("Mode: IRK RESOLUTION — resolving RPAs against provided IRK")
+                print(f"  IRK: {_mask_irk(self.irks[0].hex())}")
+            else:
+                print(f"Mode: IRK RESOLUTION — resolving RPAs against {n_irks} IRKs")
+                for i, irk in enumerate(self.irks, 1):
+                    print(f"  IRK #{i}: {_mask_irk(irk.hex())}")
             _os = platform.system()
             if _os == "Darwin":
                 print("  Note: using undocumented macOS API to retrieve real BT addresses")
@@ -649,11 +718,15 @@ class BLEScanner:
             print(f"  |  RSSI averaging: window of {self.rssi_window}")
         else:
             print()
+        if self.active and platform.system() == "Darwin":
+            print("  Note: CoreBluetooth always scans actively regardless of this flag")
         if self.environment != "free_space":
             print(f"Environment: {self.environment} "
                   f"(n={_ENV_PATH_LOSS[self.environment]})")
         if self.min_rssi is not None:
             print(f"Min RSSI: {self.min_rssi} dBm")
+        if self.name_filter is not None:
+            print(f"Name filter: \"{self.name_filter}\"")
         if self.alert_within is not None:
             print(f"Proximity alert: within {self.alert_within}m")
         if self.log_file:
@@ -733,6 +806,20 @@ class BLEScanner:
             return
 
         filename = self.output_file or f"btrpa-scan-results.{self.output_format}"
+
+        # Support writing to stdout with --output-file -
+        if filename == "-":
+            if self.output_format == "json":
+                sys.stdout.write(json.dumps(self.records, indent=2) + "\n")
+            elif self.output_format == "jsonl":
+                for record in self.records:
+                    sys.stdout.write(json.dumps(record) + "\n")
+            elif self.output_format == "csv":
+                writer = csv.DictWriter(sys.stdout, fieldnames=_FIELDNAMES)
+                writer.writeheader()
+                writer.writerows(self.records)
+            return
+
         if self.output_format == "json":
             with open(filename, "w") as f:
                 json.dump(self.records, f, indent=2)
@@ -750,6 +837,8 @@ class BLEScanner:
             print(f"  Live log written to {self.log_file}")
 
     def stop(self):
+        if not self.tui and self.running:
+            print("\nStopping scan...")
         self.running = False
 
 
@@ -781,6 +870,10 @@ def _bt_ah(irk: bytes, prand: bytes) -> bytes:
     """Bluetooth Core Spec ah() function (Vol 3, Part H, Section 2.2.2).
 
     AES-128-ECB(IRK, padding || prand) -> return last 3 bytes.
+
+    Note: ECB mode is mandated by the Bluetooth Core Specification for this
+    single-block operation.  It is not a vulnerability — only one 16-byte
+    block is ever encrypted, so ECB's lack of diffusion is irrelevant.
     """
     plaintext = b'\x00' * 13 + prand  # 16 bytes: 13 zero-pad + 3-byte prand
     cipher = Cipher(algorithms.AES(irk), modes.ECB())
@@ -856,6 +949,11 @@ def main():
         help="Resolve RPAs using this Identity Resolving Key (32 hex chars)"
     )
     parser.add_argument(
+        "--irk-file", type=str, default=None, metavar="PATH",
+        help="Read IRK(s) from a file (one per line, hex format; "
+             "lines starting with # are ignored)"
+    )
+    parser.add_argument(
         "-t", "--timeout", type=float, default=None,
         help="Scan timeout in seconds (default: 30, or infinite for --irk)"
     )
@@ -867,7 +965,8 @@ def main():
     )
     parser.add_argument(
         "-o", "--output-file", type=str, default=None, metavar="FILE",
-        help="Output file path (default: btrpa-scan-results.<format>)"
+        help="Output file path (default: btrpa-scan-results.<format>; "
+             "use - for stdout)"
     )
     parser.add_argument(
         "--log", type=str, default=None, metavar="FILE",
@@ -917,6 +1016,12 @@ def main():
              "advertise TX Power"
     )
 
+    # Filtering
+    parser.add_argument(
+        "--name-filter", type=str, default=None, metavar="PATTERN",
+        help="Filter devices by name (case-insensitive substring match)"
+    )
+
     # Proximity alerts
     parser.add_argument(
         "--alert-within", type=float, default=None, metavar="METERS",
@@ -957,13 +1062,16 @@ def main():
             f"Invalid MAC address '{args.mac}'. "
             "Expected format: XX:XX:XX:XX:XX:XX (6 colon-separated hex octets)")
 
-    if args.irk and args.all:
-        parser.error("Cannot use --irk with --all")
-    if args.irk and args.mac:
-        parser.error("Cannot use --irk with a specific MAC address")
+    # Determine if any IRK source was provided
+    has_irk = bool(args.irk or args.irk_file or os.environ.get("BTRPA_IRK"))
+
+    if has_irk and args.all:
+        parser.error("Cannot use IRK with --all")
+    if has_irk and args.mac:
+        parser.error("Cannot use IRK with a specific MAC address")
     if args.mac and args.all:
         parser.error("Cannot use --all with a specific MAC address")
-    if not args.mac and not args.all and not args.irk:
+    if not args.mac and not args.all and not has_irk:
         print(_BANNER)
         parser.print_help()
         sys.exit(0)
@@ -978,18 +1086,41 @@ def main():
     if args.tui and args.quiet:
         parser.error("Cannot use --tui with --quiet")
 
-    # Parse IRK
-    irk = None
+    if args.irk and args.irk_file:
+        parser.error("Cannot use --irk and --irk-file together")
+
+    # Parse IRKs (from --irk, --irk-file, or BTRPA_IRK env var)
+    irks: List[bytes] = []
     if args.irk:
         try:
-            irk = _parse_irk(args.irk)
+            irks.append(_parse_irk(args.irk))
         except ValueError as e:
             parser.error(str(e))
+    elif args.irk_file:
+        try:
+            with open(args.irk_file) as f:
+                for line_num, raw_line in enumerate(f, 1):
+                    stripped = raw_line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    try:
+                        irks.append(_parse_irk(stripped))
+                    except ValueError as e:
+                        parser.error(f"IRK file line {line_num}: {e}")
+        except OSError as e:
+            parser.error(f"Cannot read IRK file: {e}")
+        if not irks:
+            parser.error("IRK file contains no valid keys")
+    elif os.environ.get("BTRPA_IRK"):
+        try:
+            irks.append(_parse_irk(os.environ["BTRPA_IRK"]))
+        except ValueError as e:
+            parser.error(f"BTRPA_IRK environment variable: {e}")
 
     # Default timeout
     if args.timeout is not None:
         timeout = args.timeout
-    elif args.irk:
+    elif irks:
         timeout = float('inf')
     else:
         timeout = 30.0
@@ -1001,9 +1132,9 @@ def main():
         if not adapters:
             parser.error("--adapters requires at least one adapter name")
 
-    target = args.mac if not args.all and not args.irk else None
+    target = args.mac if not args.all and not irks else None
     scanner = BLEScanner(
-        target, timeout, irk=irk,
+        target, timeout, irks=irks,
         output_format=args.output,
         output_file=args.output_file,
         verbose=args.verbose,
@@ -1018,16 +1149,13 @@ def main():
         adapters=adapters,
         gps=not args.no_gps,
         ref_rssi=args.ref_rssi,
+        name_filter=args.name_filter,
     )
 
-    def handle_signal(*_):
-        if not args.tui:
-            print("\nStopping scan...")
-        scanner.stop()
-
-    signal.signal(signal.SIGINT, handle_signal)
-    if platform.system() != "Windows":
-        signal.signal(signal.SIGTERM, handle_signal)
+    # On Windows, asyncio doesn't support loop.add_signal_handler, so
+    # fall back to the older signal.signal approach.
+    if platform.system() == "Windows":
+        signal.signal(signal.SIGINT, lambda *_: scanner.stop())
 
     try:
         asyncio.run(scanner.scan())

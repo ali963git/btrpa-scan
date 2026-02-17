@@ -9,15 +9,17 @@ A Bluetooth Low Energy (BLE) scanner with advanced Resolvable Private Address (R
 
 - **Discover All Devices** - Scan for all broadcasting BLE devices in range with signal strength, estimated distance, manufacturer data, and service UUIDs
 - **Targeted Search** - Search for a specific device by MAC address and monitor every detection
-- **IRK Resolution** - Resolve Resolvable Private Addresses against a known Identity Resolving Key to identify a device using randomized addresses for privacy
+- **IRK Resolution** - Resolve Resolvable Private Addresses against one or more Identity Resolving Keys to identify devices using randomized addresses for privacy
+- **Multiple IRKs** - Load multiple IRKs from a file to resolve addresses for several devices in a single scan
 - **RSSI Filtering** - Filter out weak signals with a minimum RSSI threshold
 - **RSSI Averaging** - Sliding window average smooths noisy BLE RSSI readings for more stable distance estimates
+- **Name Filtering** - Filter devices by name with case-insensitive substring matching
 - **Active Scanning** - Send SCAN_REQ to get SCAN_RSP with additional service UUIDs and device names that passive scanning misses
 - **Environment Presets** - Indoor, outdoor, and free-space path-loss models for more accurate distance estimation
 - **Proximity Alerts** - Audible/visual alert when a device is estimated within a configurable distance
 - **Live TUI** - Curses-based live-updating table sorted by signal strength
 - **Real-Time CSV Log** - Stream each detection to a CSV file as it happens
-- **Batch Export** - Export results to CSV, JSON, or JSONL at end of scan
+- **Batch Export** - Export results to CSV, JSON, or JSONL at end of scan (supports stdout with `-o -`)
 - **GPS Location Stamping** - Tag each detection with GPS coordinates via gpsd; tracks per-device best location (strongest RSSI = closest proximity). On by default, degrades gracefully if gpsd is unavailable
 - **Multi-Adapter** - Scan with multiple Bluetooth adapters simultaneously (Linux)
 - **Verbose/Quiet Modes** - Verbose mode shows additional details (e.g. non-matching RPAs in IRK mode); quiet mode suppresses per-device output and shows only the summary
@@ -54,7 +56,7 @@ cgps
 
 | Platform | Notes |
 |----------|-------|
-| **macOS** | Uses CoreBluetooth. IRK mode leverages an undocumented API to retrieve real Bluetooth addresses instead of UUIDs. |
+| **macOS** | Uses CoreBluetooth. IRK mode leverages an undocumented API to retrieve real Bluetooth addresses instead of UUIDs. `--active` has no effect — CoreBluetooth always scans actively. |
 | **Linux** | May require `root` or `CAP_NET_ADMIN` capability for scanning. |
 | **Windows** | Native WinRT Bluetooth API — real MAC addresses available natively. TUI requires `pip install windows-curses`. |
 
@@ -69,11 +71,12 @@ pip install -r requirements.txt
 ## Usage
 
 ```
-usage: btrpa-scan.py [-h] [-a] [--irk HEX] [-t TIMEOUT]
+usage: btrpa-scan.py [-h] [-a] [--irk HEX] [--irk-file PATH] [-t TIMEOUT]
                      [--output {csv,json,jsonl}] [-o FILE] [--log FILE]
                      [-v | -q] [--min-rssi DBM] [--rssi-window N] [--active]
                      [--environment {free_space,indoor,outdoor}]
-                     [--ref-rssi DBM] [--alert-within METERS] [--tui]
+                     [--ref-rssi DBM] [--name-filter PATTERN]
+                     [--alert-within METERS] [--tui]
                      [--no-gps] [--adapters LIST] [mac]
 
 BLE Scanner — discover all devices or hunt for a specific one
@@ -85,11 +88,13 @@ optional arguments:
   -h, --help            show this help message and exit
   -a, --all             Scan for all broadcasting devices
   --irk HEX             Resolve RPAs using this Identity Resolving Key (32 hex chars)
+  --irk-file PATH       Read IRK(s) from a file (one per line, hex format)
   -t, --timeout TIMEOUT Scan timeout in seconds (default: 30, or infinite for --irk)
   --output {csv,json,jsonl}
                         Batch output format written at end of scan
   -o, --output-file FILE
-                        Output file path (default: btrpa-scan-results.<format>)
+                        Output file path (default: btrpa-scan-results.<format>;
+                        use - for stdout)
   --log FILE            Stream detections to a CSV file in real time
   -v, --verbose         Verbose mode — show additional details
   -q, --quiet           Quiet mode — suppress per-device output, show summary only
@@ -99,6 +104,7 @@ optional arguments:
   --environment {free_space,indoor,outdoor}
                         Distance estimation path-loss model (default: free_space)
   --ref-rssi DBM        Calibrated RSSI at 1 metre for distance estimation
+  --name-filter PATTERN Filter devices by name (case-insensitive substring match)
   --alert-within METERS Proximity alert when device is within this distance
   --tui                 Live-updating terminal table instead of scrolling output
   --no-gps              Disable GPS location stamping (GPS is on by default via gpsd)
@@ -144,6 +150,36 @@ The IRK can be provided in several formats:
 | Dash-separated | `01-23-45-67-89-AB-CD-EF-01-23-45-67-89-AB-CD-EF` |
 | 0x-prefixed | `0x0123456789ABCDEF0123456789ABCDEF` |
 
+#### IRK from a File
+
+Load one or more IRKs from a file. Each line should contain one IRK in any supported hex format. Lines starting with `#` are treated as comments:
+
+```bash
+python3 btrpa-scan.py --irk-file keys.txt
+```
+
+Example `keys.txt`:
+
+```
+# Alice's phone
+0123456789ABCDEF0123456789ABCDEF
+# Bob's watch
+FEDCBA9876543210FEDCBA9876543210
+```
+
+When multiple IRKs are loaded, each detected RPA is checked against all keys. The summary shows total matches across all keys.
+
+#### IRK from Environment Variable
+
+Set the `BTRPA_IRK` environment variable to avoid passing the key on the command line:
+
+```bash
+export BTRPA_IRK=0123456789ABCDEF0123456789ABCDEF
+python3 btrpa-scan.py
+```
+
+Priority: `--irk` > `--irk-file` > `BTRPA_IRK`
+
 ### RSSI Filtering
 
 Only show devices with signal strength above a threshold:
@@ -161,6 +197,16 @@ python3 btrpa-scan.py --all --rssi-window 5
 ```
 
 When windowing is active, the display shows both raw and averaged RSSI (e.g. `RSSI: -65 dBm (avg: -62 dBm over 5 readings)`), and distance estimation uses the averaged value. The `--min-rssi` filter also applies to the averaged RSSI, preventing a single noisy spike from dropping a device.
+
+### Name Filtering
+
+Filter devices by name using a case-insensitive substring match:
+
+```bash
+python3 btrpa-scan.py --all --name-filter "AirPods"
+```
+
+Only devices whose advertised name contains the given pattern will be shown. Devices with no name are excluded when a name filter is active.
 
 ### Active Scanning
 
@@ -263,6 +309,12 @@ python3 btrpa-scan.py --all --output jsonl -o results.jsonl -t 10
 cat results.jsonl | jq .
 ```
 
+Write output to stdout for piping:
+
+```bash
+python3 btrpa-scan.py --all --output json -o - -t 10 -q | jq .
+```
+
 ### Multi-Adapter Scanning (Linux)
 
 Scan with multiple Bluetooth adapters simultaneously for wider coverage:
@@ -321,6 +373,21 @@ An RPA consists of:
 
 btrpa-scan implements the `ah()` function from the Bluetooth Core Specification (Vol 3, Part H, Section 2.2.2) to resolve these addresses in real time.
 
+> **Note on AES-ECB:** The use of AES in ECB mode for the `ah()` function is mandated by the Bluetooth Core Specification. Because only a single 16-byte block is ever encrypted, ECB's lack of diffusion across blocks is irrelevant — this is not a vulnerability.
+
+## Security Considerations
+
+- **IRK on the command line:** Command-line arguments are visible to other users on the system via `ps`. To avoid exposing the IRK, use `--irk-file` to read from a file, or set the `BTRPA_IRK` environment variable. Console output masks IRKs by default (showing only the first and last 4 hex characters).
+- **GPS coordinates in exports:** All export formats (CSV, JSON, JSONL) and console output include GPS coordinates when available. If sharing scan results, be aware that your location may be disclosed. Use `--no-gps` to disable GPS entirely.
+- **Output file paths:** The `--output-file` and `--log` options write to the specified path. Ensure the destination has appropriate permissions for your use case.
+
+## Running Tests
+
+```bash
+pip install pytest
+python -m pytest test_btrpa_scan.py -v
+```
+
 ## Example Output
 
 ```
@@ -353,4 +420,3 @@ Scan complete - 30.0s elapsed
 ## Stopping a Scan
 
 Press `Ctrl+C` at any time to gracefully stop the scan and display summary statistics.
-
