@@ -141,7 +141,6 @@ a{color:var(--cyan)}
 #radar-canvas{width:100%;height:100%;display:block}
 #map-wrap{flex:2;position:relative;min-width:0}
 #map-wrap.hidden{display:none}
-#map-wrap.hidden ~ #radar-wrap,
 #radar-wrap.full{flex:1}
 #map{width:100%;height:100%}
 
@@ -237,7 +236,7 @@ a{color:var(--cyan)}
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+<script src="/socket.io/socket.io.js"></script>
 <!-- inject Jinja2 port variable before raw block -->
 <script>var WSPORT = {{ port }};</script>
 """ + r"""{% raw %}""" + r"""
@@ -272,6 +271,8 @@ function resizeMatrix(){
   // preserve existing columns, add new ones if wider
   while(matrixCols.length < matrixW) matrixCols.push(Math.random()*mCanvas.height);
   while(matrixData.length < matrixW) matrixData.push([]);
+  matrixCols.length = matrixW;
+  matrixData.length = matrixW;
 }
 window.addEventListener("resize", resizeMatrix);
 resizeMatrix();
@@ -284,7 +285,7 @@ var matrixPool = [
 ];
 
 function feedMatrixPool(){
-  // inject real MAC addresses and data from discovered devices
+  if(matrixPool.length > 200) return; // cap pool size
   var addrs = Object.keys(devices);
   for(var i=0;i<addrs.length;i++){
     var d = devices[addrs[i]];
@@ -544,24 +545,31 @@ function drawRadar(ts){
 
   // ── sweep with multi-layer trail ──
   sweepAngle = ((ts % SWEEP_PERIOD)/SWEEP_PERIOD)*Math.PI*2;
-  // wide dim trail
-  var trailLen1 = Math.PI*0.6;
-  var grad1 = rCtx.createConicGradient(sweepAngle - trailLen1, cx, cy);
-  grad1.addColorStop(0, "rgba(0,255,65,0)");
-  grad1.addColorStop(0.7, "rgba(0,255,65,0.03)");
-  grad1.addColorStop(1, "rgba(0,255,65,0.08)");
-  rCtx.beginPath(); rCtx.moveTo(cx,cy);
-  rCtx.arc(cx,cy,maxR, sweepAngle-trailLen1, sweepAngle);
-  rCtx.closePath(); rCtx.fillStyle = grad1; rCtx.fill();
-  // narrow bright trail
-  var trailLen2 = Math.PI*0.25;
-  var grad2 = rCtx.createConicGradient(sweepAngle - trailLen2, cx, cy);
-  grad2.addColorStop(0, "rgba(0,255,65,0)");
-  grad2.addColorStop(0.5, "rgba(0,255,65,0.06)");
-  grad2.addColorStop(1, "rgba(0,255,65,0.22)");
-  rCtx.beginPath(); rCtx.moveTo(cx,cy);
-  rCtx.arc(cx,cy,maxR, sweepAngle-trailLen2, sweepAngle);
-  rCtx.closePath(); rCtx.fillStyle = grad2; rCtx.fill();
+  if(rCtx.createConicGradient){
+    // wide dim trail
+    var trailLen1 = Math.PI*0.6;
+    var grad1 = rCtx.createConicGradient(sweepAngle - trailLen1, cx, cy);
+    grad1.addColorStop(0, "rgba(0,255,65,0)");
+    grad1.addColorStop(0.7, "rgba(0,255,65,0.03)");
+    grad1.addColorStop(1, "rgba(0,255,65,0.08)");
+    rCtx.beginPath(); rCtx.moveTo(cx,cy);
+    rCtx.arc(cx,cy,maxR, sweepAngle-trailLen1, sweepAngle);
+    rCtx.closePath(); rCtx.fillStyle = grad1; rCtx.fill();
+    // narrow bright trail
+    var trailLen2 = Math.PI*0.25;
+    var grad2 = rCtx.createConicGradient(sweepAngle - trailLen2, cx, cy);
+    grad2.addColorStop(0, "rgba(0,255,65,0)");
+    grad2.addColorStop(0.5, "rgba(0,255,65,0.06)");
+    grad2.addColorStop(1, "rgba(0,255,65,0.22)");
+    rCtx.beginPath(); rCtx.moveTo(cx,cy);
+    rCtx.arc(cx,cy,maxR, sweepAngle-trailLen2, sweepAngle);
+    rCtx.closePath(); rCtx.fillStyle = grad2; rCtx.fill();
+  } else {
+    // fallback for older browsers without createConicGradient
+    rCtx.beginPath(); rCtx.moveTo(cx,cy);
+    rCtx.arc(cx,cy,maxR, sweepAngle-Math.PI*0.4, sweepAngle);
+    rCtx.closePath(); rCtx.fillStyle = "rgba(0,255,65,0.08)"; rCtx.fill();
+  }
 
   // ── sweep line with glow ──
   var sx = cx+Math.cos(sweepAngle)*maxR, sy = cy+Math.sin(sweepAngle)*maxR;
@@ -789,7 +797,11 @@ function updateTable(){
     var va = a[sortCol], vb = b[sortCol];
     if(va==null||va==="") va = sortAsc ? Infinity : -Infinity;
     if(vb==null||vb==="") vb = sortAsc ? Infinity : -Infinity;
-    if(typeof va === "string") return sortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
+    if(typeof va === "string" || typeof vb === "string"){
+      var sa = String(va===Infinity||va===-Infinity?"":va);
+      var sb = String(vb===Infinity||vb===-Infinity?"":vb);
+      return sortAsc ? sa.localeCompare(sb) : sb.localeCompare(sa);
+    }
     return sortAsc ? va-vb : vb-va;
   });
   for(var i=0;i<list.length;i++){
@@ -929,7 +941,7 @@ var socket = io("http://"+window.location.hostname+":"+WSPORT, {transports:["web
 
 socket.on("connect", function(){
   // fetch full state on connect
-  fetch("/api/state").then(function(r){return r.json();}).then(function(state){
+  fetch("http://"+window.location.hostname+":"+WSPORT+"/api/state").then(function(r){return r.json();}).then(function(state){
     if(state.devices){
       var addrs = Object.keys(state.devices);
       for(var i=0;i<addrs.length;i++){
@@ -1091,6 +1103,10 @@ class GuiServer:
     """Flask + SocketIO server for the GUI radar interface."""
 
     def __init__(self, port: int = 5000):
+        if not _HAS_FLASK:
+            raise ImportError(
+                "GUI requires Flask and flask-socketio. "
+                "Install with: pip install flask flask-socketio")
         self._port = port
         self._app = Flask(__name__)
         self._app.config['SECRET_KEY'] = os.urandom(24).hex()
@@ -1109,33 +1125,41 @@ class GuiServer:
         @self._app.route('/api/state')
         def state():
             return jsonify({
-                'devices': self._devices,
-                'status': self._scan_status,
+                'devices': dict(self._devices),
+                'status': dict(self._scan_status) if self._scan_status else {},
                 'gps': self._gps_fix,
             })
 
     def start(self):
         """Start the Flask server in a background thread."""
-        for p in range(self._port, self._port + 11):
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.bind(('', p))
-                sock.close()
-                self._port = p
-                break
-            except OSError:
-                continue
-        else:
-            print(f"Error: Could not find open port in range "
-                  f"{self._port}-{self._port + 10}")
-            sys.exit(1)
+        started = threading.Event()
+        actual_port = [self._port]
 
-        self._thread = threading.Thread(
-            target=lambda: self._sio.run(
-                self._app, host='0.0.0.0', port=self._port,
-                allow_unsafe_werkzeug=True, log_output=False),
-            daemon=True)
+        def _serve():
+            for p in range(self._port, self._port + 11):
+                try:
+                    actual_port[0] = p
+                    started.set()
+                    self._sio.run(self._app, host='0.0.0.0', port=p,
+                                  allow_unsafe_werkzeug=True,
+                                  log_output=False)
+                    return
+                except OSError:
+                    started.clear()
+                    continue
+            actual_port[0] = -1
+            started.set()
+
+        self._thread = threading.Thread(target=_serve, daemon=True)
         self._thread.start()
+
+        # Wait for server to bind (or all ports to fail)
+        started.wait(timeout=5)
+        time.sleep(0.3)  # small extra delay for server to be ready
+        self._port = actual_port[0]
+        if self._port == -1:
+            print("Error: Could not find open port for GUI server")
+            sys.exit(1)
 
         url = f"http://localhost:{self._port}"
         print(f"  GUI server started at {url}")
@@ -1624,6 +1648,7 @@ class BLEScanner:
                 curses.start_color()
                 curses.use_default_colors()
 
+        elapsed = 0.0
         try:
             elapsed = await self._scan_loop()
         finally:
